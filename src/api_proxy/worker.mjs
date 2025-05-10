@@ -260,9 +260,8 @@ async function handleCompletions (req, apiKey) {
 
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; } // Add alt=sse for Server-Sent Events stream format
+  if (req.stream) { url += "?alt=sse"; }
 
-  // Transform the request body to Gemini format, including tools and tool_choice
   const geminiRequestBody = await transformRequest(req);
 
   const response = await fetch(url, {
@@ -275,28 +274,34 @@ async function handleCompletions (req, apiKey) {
   let fixedResponse = fixCors(response);
 
   if (response.ok) {
-    let id = generateChatcmplId(); // Generate a unique ID for the completion
+    let id = generateChatcmplId();
 
     if (req.stream) {
-        // Streaming response processing
-        // Gemini SSE sends chunks like data: {...}\n\n or event: {...}\n\n (sometimes)
-        // We need to parse each chunk, transform it, and re-encode as OpenAI SSE
        body = response.body
            .pipeThrough(new TextDecoderStream())
            .pipeThrough(new TransformStream({
-               transform: parseStream, // Parses SSE 'data: ' lines
+               transform: parseStream,
                flush: parseStreamFlush,
-               buffer: "", // State for parseStream
+               // Initialize state for parseStream here
+               start(controller) { // <-- Use start method
+                   this.buffer = "";
+               }
            }))
            .pipeThrough(new TransformStream({
-               transform: toOpenAiStream, // Transforms Gemini chunk JSON to OpenAI chunk JSON
+               transform: toOpenAiStream,
                flush: toOpenAiStreamFlush,
-               streamIncludeUsage: req.stream_options?.include_usage,
-               model, id,
-               lastCandidates: [], // State for toOpenAiStream: store last candidate state
+               // Initialize state for toOpenAiStream here
+               start(controller) { // <-- Use start method
+                   this.id = id; // Pass ID
+                   this.model = model; // Pass model
+                   this.streamIncludeUsage = req.stream_options?.include_usage; // Pass include_usage
+                   this.lastCandidates = []; // State for accumulating candidate info
+                   this.sentFirstDelta = new Map(); // State for tracking first delta
+               }
+               // No need to pass state directly as transform/flush arguments if using 'this' context
            }))
-           .pipeThrough(new TextEncoderStream()); // Encode back to bytes
-         fixedResponse.headers.set('Content-Type', 'text/event-stream'); // Correct Content-Type for SSE
+           .pipeThrough(new TextEncoderStream());
+         fixedResponse.headers.set('Content-Type', 'text/event-stream');
 
     } else {
         // Non-streaming response processing
@@ -971,18 +976,16 @@ async function parseStream (chunk, controller) {
   do {
     const match = this.buffer.match(responseLineRE);
     if (!match) { break; }
-    // Enqueue the JSON string part after "data: "
     controller.enqueue(match[1]);
-    // Remove the matched part from the buffer
     this.buffer = this.buffer.substring(match[0].length);
-  } while (this.buffer.length > 0 && this.buffer.match(responseLineRE)); // Keep processing if buffer has more complete messages
+  } while (this.buffer.length > 0 && this.buffer.match(responseLineRE));
 }
 
 async function parseStreamFlush (controller) {
+  // this.buffer is available here
   if (this.buffer) {
     console.error("Stream parser buffer not empty on flush:", this.buffer);
-    // Optional: Enqueue remaining buffer as an error chunk?
-    // controller.enqueue(JSON.stringify({ error: "Incomplete stream data" }));
+    // Optional: Handle remaining buffer
   }
 }
 
@@ -990,13 +993,11 @@ const delimiter = "\n\n"; // OpenAI SSE delimiter
 
 // Transformer from Gemini stream chunk JSON to OpenAI stream chunk JSON
 async function toOpenAiStream (chunkJsonString, controller) {
-  const transform = transformResponseStream.bind(this); // Bind 'this' context (state)
+  // this.id, this.model, this.streamIncludeUsage, this.lastCandidates, this.sentFirstDelta
+  // are now initialized in the TransformStream start method
+  const transform = transformResponseStream.bind(this); // Still bind 'this' context
 
-  // chunkJsonString is expected to be the JSON string from parseStream
-  if (!chunkJsonString) {
-      console.warn("Received empty JSON string from parseStream.");
-      return; // Skip empty chunks
-  }
+  if (!chunkJsonString) { return; }
 
   let data;
   try {
@@ -1058,16 +1059,14 @@ async function toOpenAiStream (chunkJsonString, controller) {
 
   // We expect candidates, usually just one in a streaming chunk
   data.candidates.forEach(cand => {
-      // Find or initialize state for this candidate index
       const index = cand.index || 0;
       if (!this.lastCandidates[index]) {
           this.lastCandidates[index] = { delta: {}, finish_reason: null };
       }
       const last = this.lastCandidates[index];
 
-      // --- Process Delta Content or Tool Calls ---
-      const transformedCand = transformCandidates("delta", cand, true); // isStreaming = true
-      const delta = transformedCand.delta; // This delta might have 'content' or 'tool_calls'
+      const transformedCand = transformCandidates("delta", cand, true);
+      const delta = transformedCand.delta;
 
 
       // Append content delta if present
@@ -1096,61 +1095,40 @@ async function toOpenAiStream (chunkJsonString, controller) {
       // If a chunk *does* contain a finishReason, store it.
       if (cand.finishReason) {
            last.finish_reason = reasonsMap[cand.finishReason] || cand.finishReason;
+           last.finished = true;
+           if (data.usageMetadata && this.streamIncludeUsage) {
+               last.usageMetadata = data.usageMetadata;
+           }
       }
 
-       // --- Enqueue OpenAI compatible chunk ---
-       // The chunk to enqueue should contain the *current* delta for this candidate
        const openaiChunk = {
             id: this.id,
             choices: [{
                 index: index,
-                delta: delta, // Send the delta processed from THIS chunk
-                finish_reason: null, // finish_reason is typically sent on the final DONE chunk
+                delta: delta,
+                finish_reason: null,
             }],
             created: Math.floor(Date.now()/1000),
             model: this.model,
             object: "chat.completion.chunk",
-            // Usage is only included in the final chunk if requested
-            // ...(this.streamIncludeUsage && ??? ), // Usage comes in usageMetadata
        };
 
        // OpenAI spec sometimes requires 'role: assistant' in the first delta for a choice
        // The transformCandidates function already adds role: "assistant" to the delta object structure.
        // Ensure it's there for the very first delta chunk of a candidate.
-        if (!this.sentFirstDelta[index]) {
+        if (!this.sentFirstDelta.has(index)) { // Use has() for Map
             if (!openaiChunk.choices[0].delta.role) {
                  openaiChunk.choices[0].delta.role = "assistant";
             }
-             this.sentFirstDelta[index] = true;
+             this.sentFirstDelta.set(index, true); // Use set() for Map
         }
 
 
        // Enqueue the chunk
        controller.enqueue(`data: ${JSON.stringify(openaiChunk)}${delimiter}`);
 
-        // Store the latest state of the candidate for the flush function
-        // The lastCandidates state accumulates content and final finish_reason
-        if (cand.content?.parts) {
-            // Accumulate content for flush, only if content is present in this chunk
-            // This is needed to get the total usage calculation right potentially,
-            // or if you needed to reconstruct the full message in the flush (less common for simple proxy)
-             // Note: Simple content accumulation might be complex with tool calls interleaved.
-             // Let's primarily use the finish_reason for flush logic.
-        }
-        if (cand.finishReason) {
-             // If a finish reason is in this chunk, mark this candidate as finished
-             last.finish_reason = reasonsMap[cand.finishReason] || cand.finishReason;
-             last.finished = true; // Custom flag for flushing
-             // Accumulate usage metadata if present on this final chunk
-             if (data.usageMetadata && this.streamIncludeUsage) {
-                 last.usageMetadata = data.usageMetadata;
-             }
-        }
-   });
 
-   // Check if all active candidates are finished. If so, prepare for DONE.
-   // This requires more complex state tracking than currently implemented.
-   // Let's rely on the flush function being called when the upstream stream ends.
+   });
 
 }
 
@@ -1163,55 +1141,42 @@ async function toOpenAiStream (chunkJsonString, controller) {
 // sentFirstDelta: Map<number, boolean> to track if role: assistant was sent for each index
 
 async function toOpenAiStreamFlush (controller) {
-   // When the upstream stream ends, send finish_reason for any candidates that finished
-   // and then send the [DONE] signal.
-
-   // If there were any candidates at all
+   // this.id, this.model, this.streamIncludeUsage, this.lastCandidates
+   // are available here
    if (this.lastCandidates.length > 0) {
        this.lastCandidates.forEach((last, index) => {
-           // If the candidate finished (indicated by finish_reason being set)
            if (last.finish_reason) {
-                // Send a final chunk for this candidate with the finish_reason
                 const openaiChunk = {
                    id: this.id,
                    choices: [{
                        index: index,
-                       delta: {}, // Empty delta for the final stop chunk
+                       delta: {},
                        finish_reason: last.finish_reason,
                    }],
                    created: Math.floor(Date.now()/1000),
                    model: this.model,
                    object: "chat.completion.chunk",
-                    // Include usage metadata if requested and available for this candidate
                     ...(this.streamIncludeUsage && last.usageMetadata && { usage: transformUsage(last.usageMetadata) }),
                };
                 controller.enqueue(`data: ${JSON.stringify(openaiChunk)}${delimiter}`);
            } else {
-               // Candidate ended without a finish reason? Could be an error or unexpected end.
                 console.warn(`Stream ended for candidate index ${index} without a finish_reason.`);
-                // Optionally send an error finish reason
                  const openaiChunk = {
                    id: this.id,
                    choices: [{
                        index: index,
-                       delta: {}, // Empty delta
-                       finish_reason: "error", // Custom error reason
+                       delta: {},
+                       finish_reason: "error",
                    }],
                    created: Math.floor(Date.now()/1000),
                    model: this.model,
                    object: "chat.completion.chunk",
-                   // Usage might not be available for interrupted streams
                };
                 controller.enqueue(`data: ${JSON.stringify(openaiChunk)}${delimiter}`);
            }
        });
    } else {
-       // If no candidates were processed at all, perhaps the stream was empty or errored early.
-       // If streamIncludeUsage was requested, and there was usageMetadata on a non-candidate chunk,
-       // you might need to store and send it here. This requires more complex state.
-       // For simplicity, usage might be missed in edge cases if not attached to a candidate's final chunk.
        console.warn("Stream ended with no candidates processed.");
-       // Optionally send an empty choice with an error finish reason for index 0
          const openaiChunk = {
             id: this.id,
             choices: [{
@@ -1224,38 +1189,7 @@ async function toOpenAiStreamFlush (controller) {
             object: "chat.completion.chunk",
          };
          controller.enqueue(`data: ${JSON.stringify(openaiChunk)}${delimiter}`);
-
    }
 
-
-  // Send the final [DONE] signal
   controller.enqueue(`data: [DONE]${delimiter}`);
 }
-
-// Initial state setup for toOpenAiStream
-// Note: This requires the TransformStream constructor to support initial state or for `this` to be an object
-// passed into the transform/flush methods. Cloudflare Workers' TransformStream supports this.
-// Initialize sentFirstDelta state
-Object.defineProperty(toOpenAiStream.prototype, 'sentFirstDelta', {
-    value: new Map(),
-    writable: true,
-    configurable: true
-});
-// Initialize lastCandidates state
-Object.defineProperty(toOpenAiStream.prototype, 'lastCandidates', {
-    value: [],
-    writable: true,
-    configurable: true
-});
-// Initialize buffer state for parseStream
-Object.defineProperty(parseStream.prototype, 'buffer', {
-    value: "",
-    writable: true,
-    configurable: true
-});
-// parseStreamFlush also needs the buffer state
-Object.defineProperty(parseStreamFlush.prototype, 'buffer', {
-    value: "", // Should reference the same buffer as parseStream
-    writable: true,
-    configurable: true
-});
