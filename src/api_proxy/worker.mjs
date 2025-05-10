@@ -718,28 +718,36 @@ const transformMessages = async (messages) => {
 
 const transformRequest = async (req) => {
     const { system_instruction, contents } = await transformMessages(req.messages);
-
+    const geminiFunctionDeclarations = req.tools && Array.isArray(req.tools) && req.tools.length > 0
+        ? req.tools.map(tool => {
+            // Assuming only 'function' type tools are supported
+            if (tool.type === 'function' && tool.function?.name && tool.function?.parameters) {
+                // Return just the functionDeclaration object itself
+                return {
+                    name: tool.function.name,
+                    description: tool.function.description, // Optional
+                    parameters: tool.function.parameters, // JSON Schema object
+                };
+            } else {
+                console.warn("Skipping unsupported tool type or missing function details:", tool);
+                return null; // Skip invalid tool definitions
+            }
+        }).filter(t => t != null) // Remove skipped tools
+        : []; // If no valid tools, the array is empty
+  
     const requestBody = {
         contents: contents,
         generationConfig: transformConfig(req),
-        safetySettings: req.safety_settings || safetySettings, // Use request safety settings if provided, else default
-        // Gemini tools definition - directly map from OpenAI tools
-        tools: req.tools && Array.isArray(req.tools) && req.tools.length > 0
-               ? req.tools.map(tool => {
-                   // Assuming only 'function' type tools are supported
-                   if (tool.type === 'function' && tool.function?.name && tool.function?.parameters) {
-                       // OpenAI function parameters use JSON Schema format, which Gemini also uses
-                       return { functionDeclaration: {
-                           name: tool.function.name,
-                           description: tool.function.description, // Optional
-                           parameters: tool.function.parameters, // JSON Schema object
-                       }};
-                   } else {
-                       console.warn("Skipping unsupported tool type or missing function details:", tool);
-                       return null; // Skip invalid tool definitions
-                   }
-               }).filter(t => t != null) // Remove skipped tools
-               : undefined, // Pass undefined if no valid tools
+        safetySettings: req.safety_settings || safetySettings,
+
+        // Construct the 'tools' field for the Gemini request
+        // It should be an array containing an object with 'functionDeclarations' array
+        tools: geminiFunctionDeclarations.length > 0
+               ? [{ functionDeclarations: geminiFunctionDeclarations }] // <-- Correct structure
+               : undefined, // Pass undefined if no function declarations
+
+        // Map OpenAI tool_choice to Gemini tool_config function_calling_config
+        // ... (tool_config mapping logic remains the same) ...
     };
 
     // Map OpenAI tool_choice to Gemini tool_config function_calling_config
